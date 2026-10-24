@@ -1,0 +1,12 @@
+/target/
+/data/
+/dist/
+/verification/
+/vendor/*
+!/vendor/eframe/
+/vendor/eframe/.cargo-ok
+/vendor/eframe/.cargo_vcs_info.json
+.env
+.env.*
+*.pem
+*.key
