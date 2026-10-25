@@ -589,3 +589,51 @@ pub fn queue_edit_test(paths: Vec<PathBuf>) -> Result<()> {
     );
     Ok(())
 }
+
+pub fn manual_next_test(path: PathBuf) -> Result<()> {
+    let engine = AudioEngine::new()?;
+    engine.set_volume(0.0);
+    engine.send(Command::Queue(vec![path; 8], 0));
+    engine.send(Command::Mode(Repeat::All, true));
+    wait_for(&engine, || engine.state.token.load(Ordering::Acquire) > 0)?;
+    let mut non_sequential = false;
+    let mut observed = vec![engine.state.index.load(Ordering::Relaxed)];
+    for _ in 0..32 {
+        let token = engine.state.token.load(Ordering::Acquire);
+        let before = engine.state.index.load(Ordering::Relaxed);
+        engine.send(Command::Next);
+        wait_for(&engine, || {
+            engine.state.token.load(Ordering::Acquire) != token
+        })?;
+        let after = engine.state.index.load(Ordering::Relaxed);
+        anyhow::ensure!(
+            after < 8 && after != before,
+            "Invalid manual shuffle transition"
+        );
+        non_sequential |= after != (before + 1) % 8;
+        observed.push(after);
+    }
+    println!("{}", serde_json::json!({"manual_shuffle_indices":observed}));
+    anyhow::ensure!(
+        non_sequential,
+        "Manual Next ignored shuffle and always advanced sequentially"
+    );
+    engine.send(Command::Mode(Repeat::All, false));
+    let token = engine.state.token.load(Ordering::Acquire);
+    let before = engine.state.index.load(Ordering::Relaxed);
+    engine.send(Command::Next);
+    wait_for(&engine, || {
+        engine.state.token.load(Ordering::Acquire) != token
+    })?;
+    anyhow::ensure!(
+        engine.state.index.load(Ordering::Relaxed) == (before + 1) % 8,
+        "Sequential Next changed"
+    );
+    let underruns = engine.state.underruns.load(Ordering::Relaxed);
+    anyhow::ensure!(underruns == 0, "Manual Next underruns: {underruns}");
+    println!(
+        "{}",
+        serde_json::json!({"manual_next_test":"passed","underruns":underruns})
+    );
+    Ok(())
+}

@@ -4,7 +4,7 @@ use crate::{
     decode::TrackInfo,
 };
 use crate::{
-    library::{Library, Playlist, Request, Response, Track},
+    library::{Library, Playlist, PlaylistTarget, Request, Response, Track},
     settings::{self, Settings},
 };
 use eframe::egui::{self, Color32, RichText};
@@ -39,6 +39,16 @@ pub struct PlayerApp {
     query_generation: u64,
     library_page: Vec<Track>,
     library_total: usize,
+    library_paths: Vec<PathBuf>,
+    library_show_all: bool,
+    library_loading: bool,
+    library_selection: crate::selection::RowSelection,
+    playlist_selection: crate::selection::RowSelection,
+    collection_focus: Option<egui::Id>,
+    adding_tracks: bool,
+    collection_status: String,
+    new_playlist_tracks: Option<Vec<PathBuf>>,
+    new_playlist_name: String,
     page_offset: usize,
     scan_status: String,
     roots: Vec<PathBuf>,
@@ -71,6 +81,7 @@ enum DialogResult {
     Files(Vec<PathBuf>),
     Folder(PathBuf),
     Lyrics(PathBuf, PathBuf),
+    Reveal(Result<(), String>),
 }
 
 impl PlayerApp {
@@ -180,6 +191,16 @@ impl PlayerApp {
             query_generation: 0,
             library_page: Vec::new(),
             library_total: 0,
+            library_paths: Vec::new(),
+            library_show_all: false,
+            library_loading: false,
+            library_selection: Default::default(),
+            playlist_selection: Default::default(),
+            collection_focus: None,
+            adding_tracks: false,
+            collection_status: String::new(),
+            new_playlist_tracks: None,
+            new_playlist_name: String::new(),
             page_offset: 0,
             scan_status: String::new(),
             roots: saved.roots,
@@ -222,6 +243,11 @@ impl PlayerApp {
     fn poll(&mut self) {
         while let Ok(result) = self.dialog_rx.try_recv() {
             match result {
+                DialogResult::Reveal(result) => {
+                    if let Err(error) = result {
+                        self.error = Some(error);
+                    }
+                }
                 DialogResult::Files(paths) => {
                     if !paths.is_empty() {
                         let start = self.queue.len();
@@ -258,9 +284,15 @@ impl PlayerApp {
                 Response::Page {
                     tracks,
                     total,
+                    paths,
                     generation,
                 } => {
                     if generation == self.query_generation {
+                        if self.library_paths != paths {
+                            self.library_selection.clear();
+                        }
+                        self.library_paths = paths;
+                        self.library_loading = false;
                         self.library_page = tracks;
                         self.library_total = total;
                     }
@@ -277,8 +309,27 @@ impl PlayerApp {
                 Response::Playlist { id, paths } => {
                     if id == self.playlist_id {
                         self.queue = paths;
+                        self.playlist_selection.clear();
                         self.playlist_loaded = true;
                     }
+                }
+                Response::TracksAdded { id, paths } => {
+                    self.adding_tracks = false;
+                    if self.playback_playlist == Some(id) {
+                        if let Some(engine) = &self.engine {
+                            engine.send(Command::UpdateQueue(paths.clone(), None));
+                        }
+                    }
+                    if id == self.playlist_id {
+                        self.queue = paths;
+                    }
+                    let name = self
+                        .playlists
+                        .iter()
+                        .find(|p| p.id == id)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("清單");
+                    self.collection_status = format!("已加入「{name}」");
                 }
                 Response::ScanProgress {
                     processed,
@@ -295,7 +346,11 @@ impl PlayerApp {
                         self.query_library();
                     }
                 }
-                Response::Error(e) => self.error = Some(e),
+                Response::Error(e) => {
+                    self.adding_tracks = false;
+                    self.library_loading = false;
+                    self.error = Some(e);
+                }
                 Response::Saved => (),
             }
         }
@@ -383,10 +438,13 @@ impl PlayerApp {
     }
     fn query_library(&mut self) {
         self.query_generation += 1;
+        self.library_loading = true;
+        self.library_page.clear();
         if let Some(l) = &self.library {
             l.send(Request::Query {
                 text: self.search.clone(),
                 offset: self.page_offset,
+                show_all: self.library_show_all,
                 generation: self.query_generation,
             });
         }
@@ -454,12 +512,31 @@ impl PlayerApp {
     }
 
     fn collection_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_enabled_ui(!self.adding_tracks, |ui| self.collection_contents(ui, ctx));
+        self.new_playlist_dialog(ctx);
+    }
+
+    fn collection_contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let focused = ctx.memory(|m| m.focused());
+        if self.collection_focus.is_some()
+            && focused == self.collection_focus
+            && (!self.library_tab || !self.library_loading)
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A))
+        {
+            if self.library_tab {
+                self.library_selection.select_all(self.library_paths.len());
+            } else {
+                self.playlist_selection.select_all(self.queue.len());
+            }
+        }
         ui.horizontal_wrapped(|ui| {
             if ui.selectable_label(!self.library_tab, "播放清單").clicked() {
                 self.library_tab = false;
+                self.collection_focus = None;
             }
             if ui.selectable_label(self.library_tab, "音樂庫").clicked() {
                 self.library_tab = true;
+                self.collection_focus = None;
                 self.query_library();
             }
             if button(ui, "+", "掃描資料夾").clicked() {
@@ -473,6 +550,9 @@ impl PlayerApp {
                 }
             }
         });
+        if !self.collection_status.is_empty() {
+            ui.small(&self.collection_status);
+        }
         if !self.scan_status.is_empty() {
             ui.small(&self.scan_status);
         }
@@ -487,36 +567,53 @@ impl PlayerApp {
                     .changed()
                 {
                     self.page_offset = 0;
+                    self.library_selection.clear();
                     self.query_library();
                 }
                 ui.label(format!("{} 首", self.library_total));
             });
-            ui.horizontal_wrapped(|ui| {
-                if enabled_button(ui, self.page_offset > 0, "prev", "上一頁").clicked() {
-                    self.page_offset = self.page_offset.saturating_sub(100);
-                    self.query_library();
-                }
-                ui.label(format!(
-                    "{}–{}",
-                    if self.library_total == 0 {
-                        0
-                    } else {
-                        self.page_offset + 1
-                    },
-                    (self.page_offset + 100).min(self.library_total)
-                ));
-                if enabled_button(
-                    ui,
-                    self.page_offset + 100 < self.library_total,
-                    "next",
-                    "下一頁",
-                )
-                .clicked()
-                {
-                    self.page_offset += 100;
-                    self.query_library();
-                }
-            });
+            if ui
+                .checkbox(&mut self.library_show_all, "顯示全部搜尋結果")
+                .changed()
+            {
+                self.page_offset = 0;
+                self.query_library();
+            }
+            if !self.library_show_all {
+                ui.horizontal_wrapped(|ui| {
+                    if enabled_button(ui, self.page_offset > 0, "prev", "上一頁").clicked() {
+                        self.page_offset = self.page_offset.saturating_sub(100);
+                        self.query_library();
+                    }
+                    ui.label(format!(
+                        "{}–{}",
+                        if self.library_total == 0 {
+                            0
+                        } else {
+                            self.page_offset + 1
+                        },
+                        (self.page_offset + 100).min(self.library_total)
+                    ));
+                    if enabled_button(
+                        ui,
+                        self.page_offset + 100 < self.library_total,
+                        "next",
+                        "下一頁",
+                    )
+                    .clicked()
+                    {
+                        self.page_offset += 100;
+                        self.query_library();
+                    }
+                });
+            }
+            ui.small(format!(
+                "已選 {} 首（Ctrl+A 選取全部搜尋結果）",
+                self.library_selection.rows.len()
+            ));
+            if self.library_loading {
+                ui.spinner();
+            }
             let mut add = None;
             let mut play = None;
             egui::ScrollArea::vertical().show_rows(
@@ -525,34 +622,62 @@ impl PlayerApp {
                 self.library_page.len(),
                 |ui, range| {
                     for i in range {
-                        let track = &self.library_page[i];
-                        ui.horizontal_wrapped(|ui| {
-                            if button(ui, "+", "加入目前清單").clicked() {
-                                add = Some(track.path.clone());
-                            }
-                            ui.vertical(|ui| {
-                                if ui
-                                    .add(
-                                        egui::Label::new(&track.title)
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                    )
-                                    .double_clicked()
-                                {
+                        let track = self.library_page[i].clone();
+                        let row = self.page_offset + i;
+                        ui.push_id(("library-track", row), |ui| {
+                            ui.horizontal(|ui| {
+                                if button(ui, "+", "加入目前清單").clicked() {
+                                    add = Some(track.path.clone());
+                                }
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 44.0),
+                                    egui::Sense::click(),
+                                );
+                                let selected = self.library_selection.rows.contains(&row);
+                                if selected || response.hovered() {
+                                    let fill = if selected {
+                                        ui.visuals().selection.bg_fill
+                                    } else {
+                                        ui.visuals().widgets.hovered.bg_fill
+                                    };
+                                    ui.painter().rect_filled(rect, 4.0, fill);
+                                }
+                                let painter = ui
+                                    .painter()
+                                    .with_clip_rect(rect.intersect(ui.clip_rect()).shrink(4.0));
+                                let color = if selected {
+                                    ui.visuals().selection.stroke.color
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                painter.text(
+                                    rect.left_top() + egui::vec2(8.0, 4.0),
+                                    egui::Align2::LEFT_TOP,
+                                    &track.title,
+                                    egui::FontId::proportional(14.0),
+                                    color,
+                                );
+                                painter.text(
+                                    rect.left_top() + egui::vec2(8.0, 25.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!(
+                                        "{} · {} · {}",
+                                        track.artist,
+                                        track.album,
+                                        time_label(track.duration)
+                                    ),
+                                    egui::FontId::proportional(11.0),
+                                    color,
+                                );
+                                let response = response.on_hover_text(format!(
+                                    "{}\n{} · {}",
+                                    track.title, track.artist, track.album
+                                ));
+                                self.select_row(&response, row, true);
+                                if response.double_clicked() {
                                     play = Some(track.path.clone());
                                 }
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(format!(
-                                            "{} · {} · {}",
-                                            track.artist,
-                                            track.album,
-                                            time_label(track.duration)
-                                        ))
-                                        .small(),
-                                    )
-                                    .truncate(),
-                                );
+                                response.context_menu(|ui| self.track_menu(ui, &track.path, true));
                             });
                         });
                     }
@@ -593,6 +718,9 @@ impl PlayerApp {
                         }
                     });
                 if before != self.playlist_id {
+                    self.queue.clear();
+                    self.playlist_loaded = false;
+                    self.playlist_selection.clear();
                     if let Some(l) = &self.library {
                         l.send(Request::LoadPlaylist(self.playlist_id));
                     }
@@ -626,6 +754,7 @@ impl PlayerApp {
                     self.save_queue();
                 }
             });
+            ui.small(format!("已選 {} 首", self.playlist_selection.rows.len()));
             if self.queue.is_empty() {
                 ui.add_space(20.0);
                 ui.label("將本機音樂拖曳至此，或選擇「加入音樂」");
@@ -638,23 +767,29 @@ impl PlayerApp {
             let mut edit = None;
             egui::ScrollArea::vertical().show_rows(ui, 30.0, self.queue.len(), |ui, range| {
                 for i in range {
-                    let name = self.queue[i]
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
+                    let path = self.queue[i].clone();
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    let marker = if current == Some(i) { "▶" } else { "  " };
                     let response = ui
-                        .add(
-                            egui::Button::new(format!("{:02}    {}", i + 1, name))
-                                .selected(current == Some(i))
-                                .frame(false)
-                                .truncate(),
-                        )
+                        .push_id(("playlist-track", i), |ui| {
+                            ui.add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::new(format!("{marker} {:02}    {name}", i + 1))
+                                    .selected(self.playlist_selection.rows.contains(&i))
+                                    .frame(false)
+                                    .truncate(),
+                            )
+                        })
+                        .inner
                         .on_hover_text(name.as_ref());
+                    self.select_row(&response, i, false);
                     if response.double_clicked() {
                         self.play_index(i);
                     }
                     response.context_menu(|ui| {
-                        if ui.button("播放").clicked() {
+                        self.track_menu(ui, &path, false);
+                        ui.separator();
+                        if ui.button("播放此曲").clicked() {
                             self.play_index(i);
                             ui.close_menu();
                         }
@@ -669,7 +804,7 @@ impl PlayerApp {
                             edit = Some((i, 1));
                             ui.close_menu();
                         }
-                        if ui.button("從清單移除").clicked() {
+                        if ui.button("從清單移除此曲").clicked() {
                             edit = Some((i, 0));
                             ui.close_menu();
                         }
@@ -677,6 +812,7 @@ impl PlayerApp {
                 }
             });
             if let Some((i, action)) = edit {
+                self.playlist_selection.clear();
                 match action {
                     -1 => self.queue.swap(i, i - 1),
                     1 => self.queue.swap(i, i + 1),
@@ -689,6 +825,133 @@ impl PlayerApp {
                     1 => crate::audio::QueueEdit::Swap(i, i + 1),
                     _ => crate::audio::QueueEdit::Remove(i),
                 }));
+            }
+        }
+    }
+
+    fn select_row(&mut self, response: &egui::Response, row: usize, library: bool) {
+        let selection = if library {
+            &mut self.library_selection
+        } else {
+            &mut self.playlist_selection
+        };
+        if response.clicked() {
+            let modifiers = response.ctx.input(|i| i.modifiers);
+            selection.click(row, modifiers.ctrl, modifiers.shift);
+            response.request_focus();
+            self.collection_focus = Some(response.id);
+        }
+        if response.secondary_clicked() {
+            selection.right_click(row);
+            response.request_focus();
+            self.collection_focus = Some(response.id);
+        }
+    }
+
+    fn selected_paths(&self, library: bool) -> Vec<PathBuf> {
+        let (selection, paths) = if library {
+            (&self.library_selection, &self.library_paths)
+        } else {
+            (&self.playlist_selection, &self.queue)
+        };
+        selection
+            .rows
+            .iter()
+            .filter_map(|&i| paths.get(i).cloned())
+            .collect()
+    }
+
+    fn track_menu(&mut self, ui: &mut egui::Ui, path: &std::path::Path, library: bool) {
+        let count = if library {
+            self.library_selection.rows.len()
+        } else {
+            self.playlist_selection.rows.len()
+        };
+        ui.label(format!("已選 {count} 首"));
+        let mut target = None;
+        ui.menu_button("加入播放清單", |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for playlist in &self.playlists {
+                        if ui.button(&playlist.name).clicked() {
+                            target = Some(PlaylistTarget::Existing(playlist.id));
+                            ui.close_menu();
+                        }
+                    }
+                });
+        });
+        if let Some(target) = target {
+            self.add_selected_tracks(target, self.selected_paths(library));
+        }
+        if ui.button("新增清單並加入…").clicked() {
+            self.new_playlist_tracks = Some(self.selected_paths(library));
+            self.new_playlist_name.clear();
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("開啟所在資料夾並選取此檔案").clicked() {
+            let path = path.to_owned();
+            let tx = self.dialog_tx.clone();
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let result = crate::desktop::reveal_file(&path)
+                    .map_err(|error| format!("無法定位檔案：{error:#}"));
+                let _ = tx.send(DialogResult::Reveal(result));
+                ctx.request_repaint();
+            });
+            ui.close_menu();
+        }
+    }
+
+    fn add_selected_tracks(&mut self, target: PlaylistTarget, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(library) = &self.library {
+            self.adding_tracks = true;
+            library.send(Request::AddTracks(target, paths));
+        }
+    }
+
+    fn new_playlist_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(paths) = &self.new_playlist_tracks {
+            let count = paths.len();
+            let mut open = true;
+            let mut create = false;
+            let mut cancel = false;
+            egui::Window::new("新增清單並加入")
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(format!("將選取的 {count} 首歌曲加入新清單"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_playlist_name)
+                            .hint_text("清單名稱"),
+                    );
+                    ui.horizontal(|ui| {
+                        create = enabled_button(
+                            ui,
+                            !self.new_playlist_name.trim().is_empty(),
+                            "+",
+                            "建立並加入",
+                        )
+                        .clicked();
+                        ui.label("建立並加入");
+                        cancel = button(ui, "×", "取消").clicked();
+                        ui.label("取消");
+                    });
+                });
+            if create {
+                let paths = self.new_playlist_tracks.take().unwrap();
+                self.add_selected_tracks(
+                    PlaylistTarget::New(self.new_playlist_name.clone()),
+                    paths,
+                );
+            } else if !open || cancel {
+                self.new_playlist_tracks = None;
             }
         }
     }

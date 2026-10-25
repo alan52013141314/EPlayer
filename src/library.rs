@@ -21,17 +21,24 @@ pub struct Playlist {
     pub id: i64,
     pub name: String,
 }
+pub enum PlaylistTarget {
+    Existing(i64),
+    New(String),
+}
+
 pub enum Request {
     Scan(PathBuf),
     Query {
         text: String,
         offset: usize,
+        show_all: bool,
         generation: u64,
     },
     ListPlaylists,
     LoadPlaylist(i64),
     SavePlaylist(i64, Vec<PathBuf>),
     CreatePlaylist(String),
+    AddTracks(PlaylistTarget, Vec<PathBuf>),
     RenamePlaylist(i64, String),
     DeletePlaylist(i64),
     Shutdown,
@@ -40,10 +47,15 @@ pub enum Response {
     Page {
         tracks: Vec<Track>,
         total: usize,
+        paths: Vec<PathBuf>,
         generation: u64,
     },
     Playlists(Vec<Playlist>),
     Playlist {
+        id: i64,
+        paths: Vec<PathBuf>,
+    },
+    TracksAdded {
         id: i64,
         paths: Vec<PathBuf>,
     },
@@ -237,20 +249,24 @@ fn handle(db: &mut Connection, request: Request, tx: &Sender<Response>) -> Resul
         Request::Query {
             text,
             offset,
+            show_all,
             generation,
         } => {
             let filter="instr(lower(title || char(10) || artist || char(10) || album || char(10) || path),lower(?1)) > 0";
-            let total = db.query_row(
-                &format!("SELECT count(*) FROM tracks WHERE {filter}"),
-                [&text],
-                |r| r.get::<_, usize>(0),
-            )?;
-            let tracks=db.prepare(&format!("SELECT path,title,artist,album,duration FROM tracks WHERE {filter} ORDER BY title COLLATE NOCASE,path LIMIT 100 OFFSET ?2"))?
-                .query_map(params![text,offset],|r|Ok(Track{path:PathBuf::from(r.get::<_,String>(0)?),title:r.get(1)?,artist:r.get(2)?,album:r.get(3)?,duration:r.get(4)?}))?
+            let paths = db
+                .prepare(&format!(
+                    "SELECT path FROM tracks WHERE {filter} ORDER BY title COLLATE NOCASE,path"
+                ))?
+                .query_map([&text], |r| Ok(PathBuf::from(r.get::<_, String>(0)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let total = paths.len();
+            let tracks=db.prepare(&format!("SELECT path,title,artist,album,duration FROM tracks WHERE {filter} ORDER BY title COLLATE NOCASE,path LIMIT ?3 OFFSET ?2"))?
+                .query_map(params![text,offset,if show_all { -1i64 } else { 100 }],|r|Ok(Track{path:PathBuf::from(r.get::<_,String>(0)?),title:r.get(1)?,artist:r.get(2)?,album:r.get(3)?,duration:r.get(4)?}))?
                 .collect::<std::result::Result<Vec<_>,_>>()?;
             let _ = tx.send(Response::Page {
                 tracks,
                 total,
+                paths,
                 generation,
             });
         }
@@ -283,6 +299,48 @@ fn handle(db: &mut Connection, request: Request, tx: &Sender<Response>) -> Resul
                 db.execute("INSERT INTO playlists(name) VALUES(?1)", [name.trim()])?;
             }
             let _ = tx.send(Response::Playlists(playlists(db)?));
+        }
+        Request::AddTracks(target, added) => {
+            anyhow::ensure!(!added.is_empty(), "尚未選取曲目");
+            let transaction = db.transaction()?;
+            let id = match target {
+                PlaylistTarget::Existing(id) => {
+                    anyhow::ensure!(
+                        transaction.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM playlists WHERE id=?1)",
+                            [id],
+                            |r| r.get::<_, bool>(0)
+                        )?,
+                        "清單已不存在"
+                    );
+                    id
+                }
+                PlaylistTarget::New(name) => {
+                    anyhow::ensure!(!name.trim().is_empty(), "請輸入清單名稱");
+                    transaction.execute("INSERT INTO playlists(name) VALUES(?1)", [name.trim()])?;
+                    transaction.last_insert_rowid()
+                }
+            };
+            let start: usize = transaction.query_row(
+                "SELECT COALESCE(MAX(ordinal)+1,0) FROM playlist_items WHERE playlist_id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO playlist_items(playlist_id,ordinal,path) VALUES(?1,?2,?3)",
+                )?;
+                for (offset, path) in added.iter().enumerate() {
+                    statement.execute(params![id, start + offset, path.to_string_lossy()])?;
+                }
+            }
+            transaction.commit()?;
+            let paths = db
+                .prepare("SELECT path FROM playlist_items WHERE playlist_id=?1 ORDER BY ordinal")?
+                .query_map([id], |r| Ok(PathBuf::from(r.get::<_, String>(0)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let _ = tx.send(Response::Playlists(playlists(db)?));
+            let _ = tx.send(Response::TracksAdded { id, paths });
         }
         Request::RenamePlaylist(id, name) => {
             if !name.trim().is_empty() {
@@ -341,6 +399,7 @@ pub fn smoke_test(root: PathBuf) -> Result<()> {
     library.send(Request::Query {
         text: String::new(),
         offset: 0,
+        show_all: false,
         generation: 1,
     });
     let paths = loop {
@@ -389,6 +448,68 @@ pub fn smoke_test(root: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bulk_append_preserves_existing_order_duplicates_and_creates_atomically() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let a = PathBuf::from("C:/音樂/a, song.wav");
+        let b = PathBuf::from("C:/音樂/b.wav");
+        handle(&mut db, Request::SavePlaylist(1, vec![a.clone()]), &tx).unwrap();
+        handle(
+            &mut db,
+            Request::AddTracks(PlaylistTarget::Existing(1), vec![b.clone(), a.clone()]),
+            &tx,
+        )
+        .unwrap();
+        let added = rx
+            .try_iter()
+            .find_map(|r| {
+                if let Response::TracksAdded { paths, .. } = r {
+                    Some(paths)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(added, vec![a.clone(), b.clone(), a.clone()]);
+        handle(
+            &mut db,
+            Request::AddTracks(
+                PlaylistTarget::New(" 新清單 ".into()),
+                vec![b.clone(), a.clone()],
+            ),
+            &tx,
+        )
+        .unwrap();
+        let list = playlists(&db).unwrap().pop().unwrap();
+        assert_eq!(list.name, "新清單");
+        let added = rx
+            .try_iter()
+            .find_map(|r| {
+                if let Response::TracksAdded { id, paths } = r {
+                    Some((id, paths))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(added, (list.id, vec![b, a.clone()]));
+        assert!(handle(
+            &mut db,
+            Request::AddTracks(PlaylistTarget::New("  ".into()), vec![a.clone()]),
+            &tx
+        )
+        .is_err());
+        assert!(handle(
+            &mut db,
+            Request::AddTracks(PlaylistTarget::Existing(999), vec![a]),
+            &tx
+        )
+        .is_err());
+        assert_eq!(playlists(&db).unwrap().len(), 2);
+    }
+
     #[test]
     fn playlists_round_trip_order_and_delete_without_files() {
         let mut db = Connection::open_in_memory().unwrap();
@@ -445,6 +566,7 @@ mod tests {
             Request::Query {
                 text: "".into(),
                 offset: 9900,
+                show_all: false,
                 generation: 7,
             },
             &tx,
@@ -455,8 +577,10 @@ mod tests {
                 tracks,
                 total,
                 generation,
+                paths,
             } => {
                 assert_eq!(total, 10_000);
+                assert_eq!(paths.len(), 10_000);
                 assert_eq!(tracks.len(), 100);
                 assert_eq!(generation, 7);
             }
@@ -465,8 +589,36 @@ mod tests {
         handle(
             &mut db,
             Request::Query {
+                text: String::new(),
+                offset: 0,
+                show_all: true,
+                generation: 9,
+            },
+            &tx,
+        )
+        .unwrap();
+        match rx.recv().unwrap() {
+            Response::Page {
+                tracks,
+                paths,
+                total,
+                ..
+            } => {
+                assert_eq!(total, 10_000);
+                assert_eq!(tracks.len(), 10_000);
+                assert_eq!(
+                    tracks.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+                    paths
+                );
+            }
+            _ => panic!("wrong response"),
+        }
+        handle(
+            &mut db,
+            Request::Query {
                 text: "歌曲 09999".into(),
                 offset: 0,
+                show_all: false,
                 generation: 8,
             },
             &tx,

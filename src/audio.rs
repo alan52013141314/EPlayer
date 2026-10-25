@@ -576,7 +576,14 @@ fn decode_worker(
                 }
                 Command::Next => {
                     if !queue.is_empty() {
-                        index = (state.index.load(Ordering::Relaxed) + 1) % queue.len();
+                        // Manual skip advances even in Repeat::One; shuffle still applies.
+                        index = next_queue_index(
+                            state.index.load(Ordering::Relaxed),
+                            queue.len(),
+                            Repeat::All,
+                            shuffle,
+                        )
+                        .unwrap();
                         load = Some(0.0);
                         reset = true;
                     }

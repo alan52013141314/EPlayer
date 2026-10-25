@@ -301,3 +301,15 @@
 - 第一輪新長測未通過：循環到清單尾端時刪除已預讀尾列，替補分支未套用 Repeat::All，導致播放停止（缺口計數仍為 0）。保留 release-1.2.0-soak-final.jsonl 與 soak-errors.txt 作為失敗紀錄。
 - 加入最小音訊回歸，修正前 timeout；預讀替補與正常 EOF 共用 next_queue_index 後，連續三輪皆通過。以新正式版重新執行完整 600 秒長測，結果另存 soak-attempt2。
 - 最終第二輪長測通過：600 秒、20 次清單編輯、31 次載入、5 次掃描，零 underrun；暖機後工作集增長 323584 bytes。
+
+
+## 2026-10-25：PR-006／1.3.0
+
+- 加入獨立列選取狀態，支援單選、Ctrl 增減、Shift 範圍、Ctrl+Shift 追加範圍及 Ctrl+A；播放標記和選取分開顯示。
+- 使用者確認 Ctrl+A 涵蓋全部搜尋結果，並追加「顯示全部搜尋結果」選項。查詢在 worker 產生排序一致的路徑快照，介面仍只繪製可見列；搜尋結果變更會清除舊索引。
+- 右鍵批次加入既有清單或新建清單，以 SQLite 交易追加；保留重複曲目，正在播放的目標使用 UpdateQueue 保留音訊緩衝。
+- Explorer /select 初版只開啟資料夾而未可靠選取；改用獨立 COM worker 的 SHOpenFolderAndSelectItems，實際確認中文、空格與逗號檔名可選中。API 依據：https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shopenfolderandselectitems
+- 音樂庫雙行 Button 截斷 metadata，改為裁切繪製歌名與次行資訊；新清單視窗置中，操作按鈕沿用圓形樣式。
+- 使用者追加隨機下一首問題：實際引擎 32 次 Next 在舊版固定 0→1→…→7；原因為手動分支沒有讀取 shuffle。改用共用選曲規則後 32 次切歌呈隨機，關閉隨機恢復順序，零 underrun。
+- 21 項測試通過，包含一萬首分頁／全部查詢、選取規則、批次追加與新建交易；GUI 確認播放清單 5 首批次加入、音樂庫 120 首跨頁全選與新建、搜尋 Ctrl+A 不攔截、右鍵檔案定位及播放中追加保留進度。
+- 600 秒背景長測通過：31 次載入、20 次清單編輯、5 次掃描，零 underrun。

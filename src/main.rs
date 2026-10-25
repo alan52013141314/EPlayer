@@ -9,6 +9,7 @@ mod dsp;
 mod library;
 mod lyrics;
 mod media;
+mod selection;
 mod settings;
 mod spectrum;
 mod theme;
@@ -35,6 +36,13 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|x| x == "--manual-next-test") {
+        return diagnostics::manual_next_test(
+            args.get(2)
+                .ok_or_else(|| anyhow::anyhow!("Missing fixture"))?
+                .into(),
+        );
+    }
     if args.get(1).is_some_and(|x| x == "--order-test") {
         return diagnostics::order_test(
             args.get(2)

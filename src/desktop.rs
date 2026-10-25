@@ -266,3 +266,42 @@ pub fn constrain_window(settings: &mut crate::settings::WindowSettings, pixels_p
         }
     }
 }
+
+/// Called on a dedicated worker so Explorer cannot stall rendering or playback.
+pub fn reveal_file(path: &std::path::Path) -> Result<()> {
+    use windows_sys::Win32::{
+        System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
+        UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems},
+    };
+    let absolute = path.canonicalize()?;
+    let raw = absolute.to_string_lossy();
+    let display = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
+    };
+    let wide: Vec<u16> = display.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: this worker owns its COM apartment. PIDL and UTF-16 buffers remain
+    // alive for the synchronous shell call; each allocation/init is paired below.
+    unsafe {
+        let initialized = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        anyhow::ensure!(
+            initialized >= 0,
+            "COM initialization failed: {initialized:#x}"
+        );
+        let pidl = ILCreateFromPathW(wide.as_ptr());
+        let result = if pidl.is_null() {
+            Err(anyhow::anyhow!("Windows 無法識別檔案路徑"))
+        } else {
+            let result = SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0);
+            ILFree(pidl);
+            if result >= 0 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Explorer selection failed: {result:#x}"))
+            }
+        };
+        CoUninitialize();
+        result
+    }
+}
