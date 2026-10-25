@@ -24,10 +24,17 @@ pub enum Repeat {
     One,
 }
 
+#[derive(Clone, Copy)]
+pub enum QueueEdit {
+    Remove(usize),
+    Swap(usize, usize),
+}
+
 pub enum Command {
     Queue(Vec<PathBuf>, usize),
-    UpdateQueue(Vec<PathBuf>),
+    UpdateQueue(Vec<PathBuf>, Option<QueueEdit>),
     Seek(f64),
+    Restart,
     Next,
     Previous,
     Mode(Repeat, bool),
@@ -64,12 +71,68 @@ pub struct PlaybackState {
     pub ready: AtomicBool,
 }
 
-#[derive(Clone, Copy, Default)]
+fn next_queue_index(index: usize, len: usize, repeat: Repeat, shuffle: bool) -> Option<usize> {
+    if len == 0 {
+        None
+    } else if repeat == Repeat::One {
+        Some(index.min(len - 1))
+    } else if shuffle && len > 1 {
+        Some((index + rand::random_range(1..len)) % len)
+    } else if index + 1 < len {
+        Some(index + 1)
+    } else if repeat == Repeat::All {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+struct TrackSlot {
+    path: PathBuf,
+    index: AtomicUsize,
+    active: AtomicBool,
+}
+
+// Metadata is shared by buffered frames, so an edit can remap their row index
+// without discarding samples or seeking the decoder. The callback never locks.
+fn reconcile_slots(old: &[Arc<TrackSlot>], paths: &[PathBuf]) -> Vec<Arc<TrackSlot>> {
+    let mut available: std::collections::HashMap<
+        &std::path::Path,
+        std::collections::VecDeque<&Arc<TrackSlot>>,
+    > = std::collections::HashMap::new();
+    for slot in old {
+        available
+            .entry(slot.path.as_path())
+            .or_default()
+            .push_back(slot);
+    }
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let slot = available
+                .get_mut(path.as_path())
+                .and_then(|slots| slots.pop_front())
+                .cloned()
+                .unwrap_or_else(|| {
+                    Arc::new(TrackSlot {
+                        path: path.clone(),
+                        index: AtomicUsize::new(index),
+                        active: AtomicBool::new(true),
+                    })
+                });
+            slot.index.store(index, Ordering::Relaxed);
+            slot
+        })
+        .collect()
+}
+
+#[derive(Clone)]
 struct Frame {
     samples: [f32; 2],
     epoch: u64,
     token: u64,
-    index: usize,
+    slot: Arc<TrackSlot>,
     position: u64,
 }
 
@@ -199,7 +262,10 @@ fn make_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 // Drain only older generations, even while paused/buffering.
                 // A seek may publish a newer generation during this callback;
                 // leave those frames for the next callback instead of losing them.
-                while consumer.try_peek().is_some_and(|f| f.epoch < epoch) {
+                while consumer
+                    .try_peek()
+                    .is_some_and(|f| f.epoch < epoch || !f.slot.active.load(Ordering::Acquire))
+                {
                     consumer.try_pop();
                 }
                 let frame =
@@ -208,9 +274,11 @@ fn make_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
                     } else {
                         None
                     };
-                let stereo = if let Some(frame) = frame {
+                let stereo = if let Some(frame) = &frame {
                     state.token.store(frame.token, Ordering::Relaxed);
-                    state.index.store(frame.index, Ordering::Relaxed);
+                    state
+                        .index
+                        .store(frame.slot.index.load(Ordering::Relaxed), Ordering::Relaxed);
                     state
                         .position_frames
                         .store(frame.position + 1, Ordering::Relaxed);
@@ -378,6 +446,10 @@ fn decode_worker(
     rate: u32,
 ) {
     let mut queue: Vec<PathBuf> = Vec::new();
+    let mut slots: Vec<Arc<TrackSlot>> = Vec::new();
+    // Keep removed metadata alive until the worker can reclaim it; the real-time
+    // callback must not be responsible for freeing the last Arc/path allocation.
+    let mut retired: Vec<Arc<TrackSlot>> = Vec::new();
     let mut index = 0;
     let mut reader: Option<Resampled> = None;
     let mut token = 0;
@@ -393,22 +465,103 @@ fn decode_worker(
             let mut reset = false;
             match command {
                 Command::Shutdown => return,
-                Command::UpdateQueue(paths) => {
+                Command::UpdateQueue(paths, edit) => {
                     let old_index = state.index.load(Ordering::Relaxed);
-                    let current = queue.get(old_index).cloned();
-                    let retained = current.and_then(|path| paths.iter().position(|p| *p == path));
-                    index = retained.unwrap_or(old_index.min(paths.len().saturating_sub(1)));
-                    load = Some(if retained.is_some() {
-                        state.position_frames.load(Ordering::Relaxed) as f64 / rate as f64
-                    } else {
-                        0.0
+                    let audible = slots.get(old_index).cloned();
+                    let decoding = slots.get(index).cloned();
+                    let mut candidates = slots.clone();
+                    match edit {
+                        Some(QueueEdit::Remove(row)) if row < candidates.len() => {
+                            candidates.remove(row);
+                        }
+                        Some(QueueEdit::Swap(a, b))
+                            if a < candidates.len() && b < candidates.len() =>
+                        {
+                            candidates.swap(a, b)
+                        }
+                        _ => (),
+                    }
+                    let replacement = reconcile_slots(&candidates, &paths);
+                    let retained = audible.as_ref().and_then(|current| {
+                        replacement.iter().position(|s| Arc::ptr_eq(s, current))
                     });
+                    let decoder_retained = decoding.as_ref().and_then(|current| {
+                        replacement.iter().position(|s| Arc::ptr_eq(s, current))
+                    });
+                    let retained_slots: std::collections::HashSet<_> =
+                        replacement.iter().map(Arc::as_ptr).collect();
+                    for slot in slots.drain(..) {
+                        if !retained_slots.contains(&Arc::as_ptr(&slot)) {
+                            // A reset invalidates the entire old epoch atomically.
+                            // Do not empty its frames before reset is published,
+                            // especially while closing an external decoder.
+                            if retained.is_some() {
+                                slot.active.store(false, Ordering::Release);
+                            }
+                            retired.push(slot);
+                        }
+                    }
+                    slots = replacement;
                     queue = paths;
-                    reset = true;
+                    if let Some(current) = retained {
+                        state.index.store(current, Ordering::Relaxed);
+                        if let Some(decoder_index) = decoder_retained {
+                            index = decoder_index;
+                            if reader.is_none()
+                                && load.is_none()
+                                && state.finished.load(Ordering::Acquire)
+                                && !state.ended.load(Ordering::Relaxed)
+                            {
+                                if let Some(next) =
+                                    next_queue_index(index, queue.len(), repeat, shuffle)
+                                {
+                                    index = next;
+                                    load = Some(0.0);
+                                    state.finished.store(false, Ordering::Release);
+                                }
+                            }
+                        } else {
+                            // Only the prefetched next track was deleted. Buffered
+                            // current-track audio stays valid while its replacement loads.
+                            reader = None;
+                            index = current;
+                            load = None;
+                            if let Some(next) =
+                                next_queue_index(current, queue.len(), repeat, shuffle)
+                            {
+                                index = next;
+                                load = Some(0.0);
+                                state.finished.store(false, Ordering::Release);
+                            } else {
+                                state.finished.store(true, Ordering::Release);
+                            }
+                        }
+                    } else {
+                        // User requested immediate next-track playback when removing
+                        // the current row. Empty queues stop through the normal reset.
+                        index = if queue.is_empty() {
+                            0
+                        } else {
+                            old_index % queue.len()
+                        };
+                        load = Some(0.0);
+                        reset = true;
+                    }
                 }
                 Command::Queue(paths, start) => {
+                    retired.append(&mut slots);
+                    slots = reconcile_slots(&[], &paths);
                     queue = paths;
                     index = start.min(queue.len().saturating_sub(1));
+                    load = Some(0.0);
+                    reset = true;
+                    state.playing.store(true, Ordering::Relaxed);
+                }
+                Command::Restart => {
+                    index = state
+                        .index
+                        .load(Ordering::Relaxed)
+                        .min(queue.len().saturating_sub(1));
                     load = Some(0.0);
                     reset = true;
                     state.playing.store(true, Ordering::Relaxed);
@@ -462,10 +615,11 @@ fn decode_worker(
                     }
                 }
             }
+            retired.retain(|slot| Arc::strong_count(slot) > 1);
             if reset {
-                reader = None;
                 state.ready.store(false, Ordering::Release);
                 epoch = state.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                reader = None;
                 buffered_since_reset = 0;
                 state.finished.store(false, Ordering::Release);
                 state.ended.store(false, Ordering::Relaxed);
@@ -527,7 +681,7 @@ fn decode_worker(
                     samples,
                     epoch,
                     token,
-                    index,
+                    slot: slots[index].clone(),
                     position,
                 });
                 position += 1;
@@ -540,17 +694,7 @@ fn decode_worker(
             Ok(None) => {
                 reader = None;
                 state.ready.store(true, Ordering::Relaxed);
-                let next = if repeat == Repeat::One {
-                    Some(index)
-                } else if shuffle && queue.len() > 1 {
-                    Some((index + rand::random_range(1..queue.len())) % queue.len())
-                } else if index + 1 < queue.len() {
-                    Some(index + 1)
-                } else if repeat == Repeat::All && !queue.is_empty() {
-                    Some(0)
-                } else {
-                    None
-                };
+                let next = next_queue_index(index, queue.len(), repeat, shuffle);
                 if let Some(next) = next {
                     index = next;
                     load = Some(0.0);
@@ -564,5 +708,29 @@ fn decode_worker(
                 state.finished.store(true, Ordering::Release);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    #[test]
+    fn replacement_prefetch_uses_same_repeat_rules_as_normal_eof() {
+        assert_eq!(next_queue_index(2, 3, Repeat::All, false), Some(0));
+        assert_eq!(next_queue_index(2, 3, Repeat::One, false), Some(2));
+        assert_eq!(next_queue_index(2, 3, Repeat::Off, false), None);
+        assert_eq!(next_queue_index(0, 0, Repeat::All, false), None);
+    }
+    #[test]
+    fn retained_buffer_metadata_tracks_edits_and_duplicate_occurrences() {
+        let a = PathBuf::from("a.wav");
+        let b = PathBuf::from("b.wav");
+        let old = reconcile_slots(&[], &[a.clone(), b.clone(), a.clone()]);
+        let buffered = old[1].clone();
+        let edited = reconcile_slots(&old, &[b, a.clone(), a]);
+        assert!(Arc::ptr_eq(&buffered, &edited[0]));
+        assert_eq!(buffered.index.load(Ordering::Relaxed), 0);
+        assert!(Arc::ptr_eq(&old[0], &edited[1]));
+        assert!(Arc::ptr_eq(&old[2], &edited[2]));
     }
 }

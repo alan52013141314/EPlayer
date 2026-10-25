@@ -2,7 +2,7 @@
 
 Windows 10／11 x64 免安裝音樂播放器，以 Rust 開發，效能優先，介面參考千千靜聽。
 
-目前狀態：1.1.1，修正浮動視窗拖曳及未選曲提示。文件日期：2026-10-24。
+目前狀態：1.2.0，音樂庫可直接播放，清單編輯保留目前音訊緩衝。文件日期：2026-10-25。
 
 [下載 Windows x64 免安裝版](https://github.com/alan52013141314/EPlayer/releases/latest)
 
@@ -17,9 +17,11 @@ cargo test --locked
 
 原始碼包含 `vendor/eframe` 的必要修補與原始授權文字；請勿刪除該目錄。一般 WAV／FLAC／MP3 可直接播放；完整 AAC／M4A／Opus 支援需要 FFmpeg／FFprobe，放在執行檔旁的 `tools` 目錄，或以 `EPLAYER_MEDIA_TOOLS` 指定工具資料夾。公開 release 已附帶工具與授權文件。
 
-自行封裝時，將 FFmpeg 9.0.2 essentials build 解壓至 `vendor/ffmpeg/ffmpeg-9.0.2-essentials_build`，再執行 `./scripts/package.ps1 -Label 1.1.1 -ReleaseDirectory target/release`。使用者資料、音樂檔及本機 verification 原始紀錄不包含在公開儲存庫；驗收摘要見 docs/ACCEPTANCE.md。
+自行封裝時，將 FFmpeg 9.0.2 essentials build 解壓至 `vendor/ffmpeg/ffmpeg-9.0.2-essentials_build`，再執行 `./scripts/package.ps1 -Label 1.2.0 -ReleaseDirectory target/release`。使用者資料、音樂檔及本機 verification 原始紀錄不包含在公開儲存庫；驗收摘要見 docs/ACCEPTANCE.md。
 
 ## 文件入口
+
+- [PR-005：音樂庫直接播放與清單編輯](docs/PR-005-Library-Queue.md)：雙擊選項、不中斷編輯及刪除目前歌曲的行為。
 
 - [PR-003：播放器操作與視窗配置](docs/PR-003-Player-Layout.md)：本次需求與實作計劃。
 

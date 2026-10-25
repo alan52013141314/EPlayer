@@ -42,6 +42,11 @@ fn run() -> anyhow::Result<()> {
                 .into(),
         );
     }
+    if args.get(1).is_some_and(|x| x == "--queue-edit-test") {
+        return diagnostics::queue_edit_test(
+            args.iter().skip(2).map(std::path::PathBuf::from).collect(),
+        );
+    }
     if args.get(1).is_some_and(|x| x == "--seek-stress") {
         return diagnostics::seek_stress(
             args.get(2)

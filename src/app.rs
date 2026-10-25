@@ -34,6 +34,7 @@ pub struct PlayerApp {
     playback_playlist: Option<i64>,
     playlist_name: String,
     library_tab: bool,
+    library_double_click_enqueue: bool,
     search: String,
     query_generation: u64,
     library_page: Vec<Track>,
@@ -174,6 +175,7 @@ impl PlayerApp {
             playback_playlist: None,
             playlist_name: String::new(),
             library_tab: false,
+            library_double_click_enqueue: saved.library_double_click_enqueue,
             search: String::new(),
             query_generation: 0,
             library_page: Vec::new(),
@@ -367,12 +369,15 @@ impl PlayerApp {
     }
 
     fn save_queue(&self) {
+        self.save_queue_edit(None);
+    }
+    fn save_queue_edit(&self, edit: Option<crate::audio::QueueEdit>) {
         if let Some(l) = &self.library {
             l.send(Request::SavePlaylist(self.playlist_id, self.queue.clone()));
         }
         if self.playback_playlist == Some(self.playlist_id) {
             if let Some(e) = &self.engine {
-                e.send(Command::UpdateQueue(self.queue.clone()));
+                e.send(Command::UpdateQueue(self.queue.clone(), edit));
             }
         }
     }
@@ -401,6 +406,7 @@ impl PlayerApp {
             lyrics_window: self.lyrics_window,
             eq: self.eq,
             spectrum: self.show_spectrum,
+            library_double_click_enqueue: self.library_double_click_enqueue,
         };
         if let Ok(serialized) = serde_json::to_string(&saved) {
             if serialized != self.last_saved {
@@ -557,10 +563,18 @@ impl PlayerApp {
                 self.save_queue();
             }
             if let Some(path) = play {
-                let i = self.queue.len();
-                self.queue.push(path);
-                self.save_queue();
-                self.play_index(i);
+                if self.library_double_click_enqueue {
+                    let i = self.queue.len();
+                    self.queue.push(path);
+                    self.save_queue();
+                    self.play_index(i);
+                } else {
+                    self.playback_playlist = None;
+                    if let Some(engine) = &self.engine {
+                        engine.send(Command::Queue(vec![path], 0));
+                        engine.send(Command::Mode(self.repeat, self.shuffle));
+                    }
+                }
             }
         } else {
             ui.horizontal_wrapped(|ui| {
@@ -670,7 +684,11 @@ impl PlayerApp {
                         self.queue.remove(i);
                     }
                 }
-                self.save_queue();
+                self.save_queue_edit(Some(match action {
+                    -1 => crate::audio::QueueEdit::Swap(i, i - 1),
+                    1 => crate::audio::QueueEdit::Swap(i, i + 1),
+                    _ => crate::audio::QueueEdit::Remove(i),
+                }));
             }
         }
     }
@@ -789,8 +807,10 @@ impl PlayerApp {
     }
     fn toggle_playback(&mut self) {
         if let Some(e) = &self.engine {
-            if e.state.token.load(Ordering::Relaxed) == 0 || e.state.ended.load(Ordering::Relaxed) {
+            if e.state.token.load(Ordering::Relaxed) == 0 {
                 self.play_index(e.state.index.load(Ordering::Relaxed));
+            } else if e.state.ended.load(Ordering::Relaxed) {
+                e.send(Command::Restart);
             } else {
                 e.toggle();
             }
@@ -870,6 +890,11 @@ impl PlayerApp {
                             ui.separator();
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 ui.checkbox(&mut self.dark, "深色主題");
+                                ui.checkbox(
+                                    &mut self.library_double_click_enqueue,
+                                    "雙擊音樂庫時加入播放清單",
+                                );
+                                ui.small("關閉時直接播放選取歌曲，不改動播放清單。");
                                 ui.checkbox(&mut self.show_lyrics, "顯示獨立歌詞");
                                 ui.label("Ctrl+Alt+L：顯示主視窗並解除全部滑鼠穿透");
                                 let recovery =

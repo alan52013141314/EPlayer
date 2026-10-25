@@ -212,21 +212,23 @@ pub fn control_test(path: PathBuf) -> Result<()> {
     std::thread::sleep(Duration::from_millis(50));
     let retained_position = engine.position();
     let retained_token = engine.state.token.load(Ordering::Relaxed);
-    engine.send(Command::UpdateQueue(vec![path]));
+    engine.send(Command::UpdateQueue(vec![path], None));
     std::thread::sleep(Duration::from_millis(150));
     anyhow::ensure!(
         !engine.state.playing.load(Ordering::Relaxed),
         "Queue edit resumed paused playback"
     );
     engine.toggle();
-    wait_for(&engine, || {
-        engine.state.token.load(Ordering::Relaxed) > retained_token
-    })?;
+    wait_for(&engine, || engine.position() > retained_position + 0.05)?;
+    anyhow::ensure!(
+        engine.state.token.load(Ordering::Relaxed) == retained_token,
+        "Queue edit restarted the current track"
+    );
     anyhow::ensure!(
         (engine.position() - retained_position).abs() < 0.3,
         "Queue edit lost playback position"
     );
-    engine.send(Command::UpdateQueue(Vec::new()));
+    engine.send(Command::UpdateQueue(Vec::new(), None));
     wait_for(&engine, || engine.state.ended.load(Ordering::Relaxed))?;
     println!(
         "{}",
@@ -310,6 +312,7 @@ pub fn soak(seconds: u64, root: PathBuf, report: PathBuf) -> Result<()> {
     engine.send(Command::Mode(Repeat::All, false));
     let start = Instant::now();
     let mut last_phase = u64::MAX;
+    let mut queue_edits = 0;
     let mut last_log = u64::MAX;
     let mut loaded = 0;
     let mut scans = 0;
@@ -351,6 +354,12 @@ pub fn soak(seconds: u64, root: PathBuf, report: PathBuf) -> Result<()> {
         }
         let phase = elapsed / 30;
         if phase != last_phase {
+            let mut edited = paths.clone();
+            if phase.is_multiple_of(2) {
+                edited.push(paths[0].clone());
+            }
+            engine.send(Command::UpdateQueue(edited, None));
+            queue_edits += 1;
             engine
                 .spectrum
                 .shared
@@ -396,7 +405,7 @@ pub fn soak(seconds: u64, root: PathBuf, report: PathBuf) -> Result<()> {
     let underruns = engine.state.underruns.load(Ordering::Relaxed);
     let growth = process_memory().saturating_sub(baseline_memory.unwrap_or(0));
     let passed = underruns == 0 && growth < 64 * 1024 * 1024;
-    let record = serde_json::json!({"status":if passed{"passed"}else{"failed"},"duration_seconds":start.elapsed().as_secs(),"underruns":underruns,"memory_growth_after_warmup":growth,"peak_working_set":peak_memory,"tracks_loaded":loaded,"scans":scans,"scope":"audio+decode+EQ+FFT+scan; native window behavior verified separately"});
+    let record = serde_json::json!({"status":if passed{"passed"}else{"failed"},"duration_seconds":start.elapsed().as_secs(),"underruns":underruns,"memory_growth_after_warmup":growth,"peak_working_set":peak_memory,"tracks_loaded":loaded,"scans":scans,"queue_edits":queue_edits,"scope":"audio+decode+queue edits+EQ+FFT+scan; native window behavior verified separately"});
     writeln!(log, "{record}")?;
     log.sync_all()?;
     println!("{record}");
@@ -419,4 +428,164 @@ fn process_memory() -> u64 {
             0
         }
     }
+}
+
+pub fn queue_edit_test(paths: Vec<PathBuf>) -> Result<()> {
+    anyhow::ensure!(
+        paths.len() == 3,
+        "Supply three distinct long audio fixtures"
+    );
+    let (a, b, c) = (paths[0].clone(), paths[1].clone(), paths[2].clone());
+    let engine = AudioEngine::new()?;
+    engine.set_volume(0.0);
+    engine.send(Command::Queue(vec![a.clone(), b.clone()], 1));
+    wait_for(&engine, || engine.position() > 0.25)?;
+    let epoch = engine.state.epoch.load(Ordering::Acquire);
+    let token = engine.state.token.load(Ordering::Relaxed);
+    for i in 0..50 {
+        engine.send(Command::UpdateQueue(
+            if i % 2 == 0 {
+                vec![b.clone(), c.clone(), a.clone()]
+            } else {
+                vec![a.clone(), b.clone()]
+            },
+            None,
+        ));
+        std::thread::sleep(Duration::from_millis(30));
+        anyhow::ensure!(
+            engine.state.epoch.load(Ordering::Acquire) == epoch,
+            "Queue edit discarded active audio buffer at edit {i}"
+        );
+        anyhow::ensure!(
+            engine.state.token.load(Ordering::Relaxed) == token,
+            "Queue edit reopened current decoder at edit {i}"
+        );
+        anyhow::ensure!(
+            engine.state.index.load(Ordering::Relaxed) == if i % 2 == 0 { 0 } else { 1 },
+            "Buffered frame restored obsolete row index"
+        );
+    }
+    anyhow::ensure!(engine.position() > 1.5, "Playback clock failed to advance");
+    println!(
+        "{}",
+        serde_json::json!({"phase":"edits","underruns":engine.state.underruns.load(Ordering::Relaxed)})
+    );
+    engine.send(Command::UpdateQueue(vec![a.clone(), c.clone()], None));
+    wait_for(&engine, || {
+        engine.state.token.load(Ordering::Relaxed) > token
+    })?;
+    anyhow::ensure!(
+        engine.state.index.load(Ordering::Relaxed) == 1,
+        "Deleting current track did not switch to next"
+    );
+    println!(
+        "{}",
+        serde_json::json!({"phase":"remove_current","underruns":engine.state.underruns.load(Ordering::Relaxed)})
+    );
+    let next_token = engine.state.token.load(Ordering::Relaxed);
+    engine.send(Command::UpdateQueue(vec![a.clone()], None));
+    wait_for(&engine, || {
+        engine.state.token.load(Ordering::Relaxed) > next_token
+    })?;
+    anyhow::ensure!(
+        engine.state.index.load(Ordering::Relaxed) == 0,
+        "Deleting last row did not wrap to remaining track"
+    );
+    println!(
+        "{}",
+        serde_json::json!({"phase":"remove_last","underruns":engine.state.underruns.load(Ordering::Relaxed)})
+    );
+    engine.send(Command::UpdateQueue(vec![], None));
+    wait_for(&engine, || engine.state.ended.load(Ordering::Relaxed))?;
+    println!(
+        "{}",
+        serde_json::json!({"phase":"clear","underruns":engine.state.underruns.load(Ordering::Relaxed)})
+    );
+    engine.send(Command::Queue(vec![a.clone(), a.clone(), c.clone()], 1));
+    wait_for(&engine, || {
+        engine.position() > 0.1 && engine.state.index.load(Ordering::Relaxed) == 1
+    })?;
+    let duplicate_token = engine.state.token.load(Ordering::Relaxed);
+    let duplicate_epoch = engine.state.epoch.load(Ordering::Acquire);
+    engine.send(Command::UpdateQueue(
+        vec![a.clone(), c.clone()],
+        Some(crate::audio::QueueEdit::Remove(0)),
+    ));
+    std::thread::sleep(Duration::from_millis(60));
+    anyhow::ensure!(
+        engine.state.epoch.load(Ordering::Acquire) == duplicate_epoch
+            && engine.state.token.load(Ordering::Relaxed) == duplicate_token
+            && engine.state.index.load(Ordering::Relaxed) == 0,
+        "Removing another duplicate interrupted current occurrence"
+    );
+    engine.send(Command::UpdateQueue(
+        vec![c.clone()],
+        Some(crate::audio::QueueEdit::Remove(0)),
+    ));
+    wait_for(&engine, || {
+        engine.state.token.load(Ordering::Relaxed) > duplicate_token
+    })?;
+    // Exercise removal of an already-prefetched next track near the boundary.
+    let duration = crate::media::MediaReader::open(&a)?.info().duration;
+    engine.send(Command::Queue(vec![a.clone(), b, c.clone()], 0));
+    wait_for(&engine, || {
+        engine.position() > 0.1 && engine.position() < 1.0
+    })?;
+    engine.send(Command::Seek(duration - 0.3));
+    wait_for(&engine, || engine.position() > duration - 0.28)?;
+    let boundary_epoch = engine.state.epoch.load(Ordering::Acquire);
+    let boundary_token = engine.state.token.load(Ordering::Relaxed);
+    engine.send(Command::UpdateQueue(vec![a, c], None));
+    wait_for(&engine, || {
+        engine.state.token.load(Ordering::Relaxed) > boundary_token
+    })?;
+    println!(
+        "{}",
+        serde_json::json!({"phase":"boundary","underruns":engine.state.underruns.load(Ordering::Relaxed)})
+    );
+    anyhow::ensure!(
+        engine.state.epoch.load(Ordering::Acquire) == boundary_epoch,
+        "Prefetch removal discarded current tail"
+    );
+    anyhow::ensure!(
+        engine.state.index.load(Ordering::Relaxed) == 1,
+        "Prefetch replacement has wrong index"
+    );
+    // Removing the prefetched last row must still honor repeat-all at the tail.
+    let tail = paths[0].clone();
+    engine.send(Command::Queue(
+        vec![paths[0].clone(), paths[1].clone(), paths[2].clone(), tail],
+        2,
+    ));
+    engine.send(Command::Mode(Repeat::All, false));
+    wait_for(&engine, || {
+        engine.state.index.load(Ordering::Relaxed) == 2
+            && engine.position() > 0.1
+            && engine.position() < 1.0
+    })?;
+    let duration = crate::media::MediaReader::open(&paths[2])?.info().duration;
+    engine.send(Command::Seek(duration - 0.3));
+    wait_for(&engine, || engine.position() > duration - 0.28)?;
+    let token = engine.state.token.load(Ordering::Relaxed);
+    engine.send(Command::UpdateQueue(
+        paths.clone(),
+        Some(crate::audio::QueueEdit::Remove(3)),
+    ));
+    wait_for(&engine, || {
+        engine.state.token.load(Ordering::Relaxed) > token
+            && engine.state.index.load(Ordering::Relaxed) == 0
+    })?;
+    anyhow::ensure!(
+        engine.state.playing.load(Ordering::Relaxed),
+        "Repeat-all stopped after removing prefetched tail"
+    );
+    anyhow::ensure!(
+        engine.state.underruns.load(Ordering::Relaxed) == 0,
+        "Queue edits caused underruns"
+    );
+    println!(
+        "{}",
+        serde_json::json!({"queue_edit_test":"passed","edits":50,"checks":["retain decoder and samples","row remapping","delete current","delete last","empty queue","prefetched deletion", "duplicate row identity", "repeat-all after prefetched tail deletion"],"underruns":0})
+    );
+    Ok(())
 }

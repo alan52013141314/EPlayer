@@ -285,3 +285,19 @@
 - 捕捉桌面事件後以真實序列補強回歸，正反快速拖曳確認可移動且位置穩定。16 tests、clippy、release 及獨立公開來源建置核對完成。
 - 公開內容包含自有來源、文件、圖示、Cargo.lock 及必要 eframe 修補與授權；排除音樂、設定、資料庫、原始 verification、target 和 dist。FFmpeg 工具隨 release ZIP 附授權與來源連結。
 - 發布目標：公開 alan52013141314/EPlayer，Git 作者採 GitHub noreply 地址。
+
+
+## 2026-10-25：PR-005／1.2.0
+
+- 音樂庫雙擊預設為臨時單曲播放，不寫入清單；新增持久化 library_double_click_enqueue 選項。播放來源獨立，播完 Restart 使用引擎的原來源，而非目前瀏覽的清單。
+- 重現：第一筆 UpdateQueue 即改變 epoch，丟棄有效緩衝並重開目前來源。新增真實引擎 queue-edit-test 作為回歸。
+- 緩衝 frame 使用共享曲目 metadata，清單編輯只更新列索引；callback 不鎖定、不中途 seek，移除的預讀列可略過。metadata 的最終回收由 worker 保留引用處理。
+- 編輯對應使用線性索引，明確的 Remove／Swap 保留重複檔案的列身分。刪除目前歌曲依使用者答覆立即切下一首；清空停止。
+- 擴大測試發現刪除外部解碼中的目前歌曲時，先失效舊 frame 再關閉 decoder 會造成缺口。改為先發布 reset，再釋放 decoder，重複三輪回歸皆零 underrun。
+- 正式版清單測試：50 次新增／刪除／排序、當前列刪除、最後列刪除、清空、預讀下一曲刪除、重複列辨識通過。19 項單元測試及 clippy 通過。
+- 隔離 GUI：直接雙擊播放後 playlist_items=0；設定開啟後雙擊，playlist_items=1；設定已保存；直接來源播完可重播；按＋加入其他歌曲時 token 與進度持續、underruns=0。
+- 十分鐘背景耐久及最終交付核對結果記入 ACCEPTANCE.md。
+
+- 第一輪新長測未通過：循環到清單尾端時刪除已預讀尾列，替補分支未套用 Repeat::All，導致播放停止（缺口計數仍為 0）。保留 release-1.2.0-soak-final.jsonl 與 soak-errors.txt 作為失敗紀錄。
+- 加入最小音訊回歸，修正前 timeout；預讀替補與正常 EOF 共用 next_queue_index 後，連續三輪皆通過。以新正式版重新執行完整 600 秒長測，結果另存 soak-attempt2。
+- 最終第二輪長測通過：600 秒、20 次清單編輯、31 次載入、5 次掃描，零 underrun；暖機後工作集增長 323584 bytes。

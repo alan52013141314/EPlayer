@@ -19,6 +19,7 @@ pub struct Settings {
     pub lyrics_window: WindowSettings,
     pub eq: crate::dsp::EqSettings,
     pub spectrum: bool,
+    pub library_double_click_enqueue: bool,
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
@@ -88,6 +89,7 @@ impl Default for Settings {
             },
             eq: Default::default(),
             spectrum: false,
+            library_double_click_enqueue: false,
         }
     }
 }
@@ -130,6 +132,11 @@ pub fn save(dir: &Path, settings: &Settings) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_settings_default_to_direct_library_playback() {
+        let legacy: Settings = serde_json::from_str("{\"dark\":false}").unwrap();
+        assert!(!legacy.library_double_click_enqueue);
+    }
+    #[test]
     fn delayed_os_geometry_does_not_undo_preset_or_position_reset() {
         let mut window = WindowSettings::default();
         window.observe_geometry(Some([10.0, 20.0]), Some([380.0, 105.0]));
@@ -152,11 +159,13 @@ mod tests {
         let mut settings = Settings::default();
         save(&dir, &settings).unwrap();
         settings.dark = false;
+        settings.library_double_click_enqueue = true;
         settings.volume = 0.23;
         settings.roots.push(PathBuf::from("C:/音樂"));
         save(&dir, &settings).unwrap();
         let restored = load(&dir).unwrap();
         assert!(!restored.dark);
+        assert!(restored.library_double_click_enqueue);
         assert_eq!(restored.volume, 0.23);
         assert_eq!(restored.roots, settings.roots);
         std::fs::remove_file(dir.join("settings.json")).unwrap();
